@@ -1,0 +1,342 @@
+#!/bin/sh
+# campus-auth - Dr.COM campus portal auto-login daemon for OpenWrt
+#
+# Protocol reverse-engineered from a packet capture of a real login
+# (Server: DrcomServer1.2).  See the README for how to capture your own
+# portal's traffic if the parameter names differ at your school.
+#
+#   GET /drcom/login?...      result:1            = login ok
+#                             result:0 + msga "clientip online" = already online
+#   GET /drcom/chkstatus?...  result:1            = online
+#                             result:0            = offline
+#   GET /drcom/logout?...     result:1            = logged out
+#
+# The ISP / service type travels in the R3 field (pc.js template):
+#   0 = 校园网   1 = 中国移动   2 = 中国电信   3 = 中国联通   4 = 中国广电
+#
+# The portal only cares about DDDDD / upass / R3 / wlan_user_ip.
+# program_index, page_index, rcn, user_agent etc. are NOT validated by the server
+# (verified: a minimal request returns a normal, fully populated response).
+#
+# This script owns the PORTAL only. Losing the WAN address (DHCP lease) is a
+# different failure - there is no route to the portal then - and is handled by
+# /usr/bin/net-watchdog, which also keeps the durable uplink journal.
+#
+# NOTE: `server` (the portal address) has no built-in default on purpose. Set
+# it in /etc/config/campusauth before enabling the service.
+#
+# Usage: campus-auth {status|login|logout|check|daemon|journal}
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+CONF="campusauth"
+SECT="main"
+TAG="campus-auth"
+STATE="/tmp/campus-auth.status"
+JOURNAL="/etc/campus-auth.journal"
+HTTP_TIMEOUT=8
+
+cfg() { uci -q get "${CONF}.${SECT}.${1}" 2>/dev/null; }
+
+# The portal address is site specific, so there is deliberately no built-in
+# default: a hardcoded fallback would silently talk to the wrong host (or to a
+# private address that does not exist) on somebody else's campus.
+get_server() { cfg server; }
+
+log() {
+    logger -p user.info -t "$TAG" "$*"
+    [ "$VERBOSE" = "1" ] && echo "$*"
+}
+
+# Durable, deduplicated event journal. syslog cannot be trusted as evidence:
+# while the uplink is down a transparent-proxy plugin (UA3F) floods it with
+# "network is unreachable" and the ring buffer only holds a few minutes, so
+# losing the history is exactly what happens when you need it most.
+journal() {
+    local last new
+    new=$(printf '[%s] %s (ip=%s)' "$1" "$2" "$(get_wan_ip)")
+    # strip "YYYY-MM-DD HH:MM:SS " and compare the rest verbatim: pattern based
+    # extraction kept drifting out of sync with the format written below, which
+    # made the dedup useless and grew the journal by one line every cycle.
+    last=$(tail -n 1 "$JOURNAL" 2>/dev/null | cut -d' ' -f3-)
+    [ "$last" = "$new" ] && return 0
+    [ -f "$JOURNAL" ] && [ "$(wc -c < "$JOURNAL" 2>/dev/null)" -gt 100000 ] &&
+        { tail -n 400 "$JOURNAL" > "$JOURNAL.tmp" 2>/dev/null && mv "$JOURNAL.tmp" "$JOURNAL"; }
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$new" >> "$JOURNAL"
+    return 0
+}
+
+# URL-encode the characters that can break a query string. '%' must come first.
+urlenc() {
+    printf '%s' "$1" | sed \
+        -e 's/%/%25/g' \
+        -e 's/ /%20/g' \
+        -e 's/&/%26/g' \
+        -e 's/?/%3F/g' \
+        -e 's/=/%3D/g' \
+        -e 's/#/%23/g' \
+        -e 's/+/%2B/g' \
+        -e 's/@/%40/g' \
+        -e 's/"/%22/g' \
+        -e "s/'/%27/g" \
+        -e 's/</%3C/g' \
+        -e 's/>/%3E/g'
+}
+
+get_wan_iface() {
+    local ifc
+    ifc=$(cfg iface)
+    [ -z "$ifc" ] && ifc="wwan"
+    echo "$ifc"
+}
+
+get_wan_ip() {
+    local ifc lanip ip=""
+    network_get_ipaddr ip "$(get_wan_iface)" 2>/dev/null
+    if [ -z "$ip" ]; then
+        for ifc in wwan wan; do
+            network_get_ipaddr ip "$ifc" 2>/dev/null
+            [ -n "$ip" ] && break
+        done
+    fi
+    # last resort: source address used by the default route
+    [ -z "$ip" ] && ip=$(ip -4 route show default 2>/dev/null |
+                         sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)
+    # Never hand back a loopback or LAN address. Falling through to the "lan"
+    # interface reports the router's own bridge address as the WAN IP whenever
+    # the uplink has no lease; the status file would lie and the portal would
+    # be asked to authenticate an address that is not actually online.
+    case "$ip" in 127.*) ip="" ;; esac
+    if [ -n "$ip" ]; then
+        network_get_ipaddr lanip lan 2>/dev/null
+        [ -n "$lanip" ] && [ "$ip" = "$lanip" ] && ip=""
+    fi
+    echo "$ip"
+}
+
+http_get() {
+    wget -q -O - --timeout="$HTTP_TIMEOUT" "$1" 2>/dev/null
+}
+
+# pull "result":N out of a JSONP body such as: dr1003({"result":1,"uid":"..."})
+json_result() {
+    printf '%s' "$1" |
+        sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9ok]*\).*/\1/p' |
+        head -1
+}
+
+json_msga() {
+    printf '%s' "$1" |
+        sed -n 's/.*"msga"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -1
+}
+
+write_state() {
+    # $1 = online|offline|unknown, $2 = human readable detail
+    journal "$1" "$2"
+    cat > "$STATE" <<EOF
+state=$1
+detail=$2
+wan_ip=$(get_wan_ip)
+updated=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+}
+
+do_status() {
+    local server ip v url resp result
+    server=$(get_server)
+    if [ -z "$server" ]; then
+        echo "unknown"
+        return 0
+    fi
+    ip=$(get_wan_ip)
+    v=$(date +%s)
+    url="http://${server}/drcom/chkstatus?callback=dr1002&jsVersion=4.X&v=${v}&lang=zh"
+    [ -n "$ip" ] && url="${url}&wlan_user_ip=${ip}"
+    resp=$(http_get "$url")
+    result=$(json_result "$resp")
+    [ -z "$result" ] && result="unknown"
+    echo "$result"
+}
+
+do_login() {
+    local server user pass isp ip v eu ep url resp result msga
+
+    server=$(get_server)
+    isp=$(cfg isp);       [ -z "$isp" ] && isp="0"
+    user=$(cfg username)
+    pass=$(cfg password)
+
+    if [ -z "$server" ]; then
+        log "login skipped: portal address (server) is not configured"
+        write_state "unknown" "认证服务器地址未配置"
+        return 2
+    fi
+
+    if [ -z "$user" ] || [ -z "$pass" ]; then
+        log "login skipped: username/password not configured"
+        write_state "unknown" "账号或密码未配置"
+        return 2
+    fi
+
+    ip=$(get_wan_ip)
+    if [ -z "$ip" ]; then
+        log "login skipped: cannot determine WAN IP"
+        write_state "unknown" "无法获取 WAN IP"
+        return 3
+    fi
+
+    v=$(date +%s)
+    eu=$(urlenc "$user")
+    ep=$(urlenc "$pass")
+
+    url="http://${server}/drcom/login?callback=dr1003"
+    url="${url}&DDDDD=${eu}&upass=${ep}&0MKKey=123456"
+    url="${url}&R1=0&R2=&R3=${isp}&R6=0&para=00&v6ip=&R7=0"
+    url="${url}&user_account=%2C0%2C${eu}&user_password=${ep}"
+    url="${url}&wlan_user_ip=${ip}&wlan_user_ipv6=&authex_enable="
+    url="${url}&wlan_user_mac=000000000000&wlan_ac_name="
+    url="${url}&jsVersion=4.5.1&terminal_type=1&lang=zh-cn"
+    url="${url}&enable_r3=1&mac_type=0&operate=portal_login&business_type=3"
+    url="${url}&v=${v}&lang=zh"
+
+    resp=$(http_get "$url")
+    result=$(json_result "$resp")
+    msga=$(json_msga "$resp")
+
+    case "$result" in
+        1|ok)
+            log "login OK (wan_ip=${ip} isp=${isp})"
+            write_state "online" "登录成功 (${isp})"
+            uci -q set ${CONF}.${SECT}.last_login="$(date '+%Y-%m-%d %H:%M:%S')"
+            uci -q set ${CONF}.${SECT}.last_result="ok"
+            uci -q commit ${CONF}
+            return 0
+            ;;
+        0)
+            if printf '%s' "$msga" | grep -qi 'online'; then
+                log "already online, nothing to do (wan_ip=${ip})"
+                write_state "online" "已在线，无需登录"
+                return 0
+            fi
+            log "login FAILED: result=0 msga='${msga}'"
+            write_state "offline" "登录失败：${msga}"
+            uci -q set ${CONF}.${SECT}.last_result="fail: ${msga}"
+            uci -q commit ${CONF}
+            return 1
+            ;;
+        *)
+            log "login ERROR: empty/unparseable response (portal unreachable?)"
+            write_state "unknown" "认证服务器无响应"
+            return 4
+            ;;
+    esac
+}
+
+do_logout() {
+    local server v url resp result
+    server=$(get_server)
+    if [ -z "$server" ]; then
+        log "logout skipped: portal address (server) is not configured"
+        return 2
+    fi
+    v=$(date +%s)
+    url="http://${server}/drcom/logout?callback=dr1003&jsVersion=4.5.1&v=${v}&lang=zh"
+    resp=$(http_get "$url")
+    result=$(json_result "$resp")
+    log "logout: result=${result:-unknown}"
+    write_state "offline" "已注销 (result=${result:-unknown})"
+    [ "$result" = "1" ] && return 0
+    return 1
+}
+
+# Offline detection: cheap ping first, portal status as confirmation.
+# Ping alone is not enough (ICMP may be blocked while the net is fine),
+# and the portal alone is not enough either (server may be unreachable).
+do_check() {
+    local host st
+    host=$(cfg ping_host)
+    [ -z "$host" ] && host="223.5.5.5"
+
+    if ping -c 1 -W 3 "$host" >/dev/null 2>&1; then
+        log "check: online (ping ${host} ok)"
+        write_state "online" "网络正常"
+        return 0
+    fi
+
+    # No WAN address at all means this is not a portal problem - there is no
+    # route to the portal to begin with. net-watchdog owns DHCP recovery; just
+    # report it and retry soon (see do_daemon) instead of firing a login
+    # request that could not possibly be delivered.
+    if [ -z "$(get_wan_ip)" ]; then
+        log "check: uplink has no IP (dhcp lease lost?) - net-watchdog will recover"
+        write_state "unknown" "上行无 IP，等待重新获取租约"
+        return 3
+    fi
+
+    st=$(do_status)
+    if [ "$st" = "1" ] || [ "$st" = "ok" ]; then
+        log "check: ping failed but portal reports online (result=${st}) - skip login"
+        write_state "online" "探测失败但认证在线"
+        return 0
+    fi
+
+    log "check: offline (ping ${host} failed, portal result=${st:-empty}) -> login"
+    do_login
+}
+
+do_daemon() {
+    local interval base backoff fails=0
+    base=$(cfg interval)
+    [ -z "$base" ] && base=30
+    [ "$base" -lt 10 ] && base=10
+    log "daemon started (base interval=${base}s)"
+
+    while true; do
+        if do_check; then
+            fails=0
+            interval=$base
+        else
+            fails=$((fails + 1))
+            if [ -z "$(get_wan_ip)" ]; then
+                # No lease at all. The exponential backoff would delay
+                # recovery by up to 16 minutes after the uplink comes back,
+                # so keep polling at a short fixed interval instead. This is
+                # cheap: do_check returns before any HTTP request is made.
+                interval=$((base * 2))
+            elif [ "$fails" -gt 5 ]; then
+                # back off so we never hammer the portal: 1x 2x 4x ... 32x
+                interval=$((base * 32))
+            else
+                interval=$((base * (1 << (fails - 1))))
+            fi
+            log "check failed (#${fails}), next check in ${interval}s"
+        fi
+        sleep "$interval"
+    done
+}
+
+usage() {
+    cat <<EOF
+Usage: $0 {status|login|logout|check|daemon|journal}
+
+  status   query the portal, print result (1=online, 0=offline)
+  login    send a login request
+  logout   send a logout request
+  check    detect offline and log in if needed (single shot)
+  daemon   run the check loop (used by procd)
+  journal  print the durable event journal ($JOURNAL)
+EOF
+}
+
+case "$1" in
+    status)  do_status ;;
+    login)   do_login;  exit $? ;;
+    logout)  do_logout; exit $? ;;
+    check)   do_check;  exit $? ;;
+    daemon)  VERBOSE=0; do_daemon ;;
+    journal) tail -n 200 "$JOURNAL" 2>/dev/null ;;
+    *)       usage; exit 1 ;;
+esac
+exit 0

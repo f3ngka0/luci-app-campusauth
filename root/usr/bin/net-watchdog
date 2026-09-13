@@ -1,0 +1,301 @@
+#!/bin/sh
+# net-watchdog - uplink health recorder + auto-recovery for the campus uplink
+#
+# WHY THIS EXISTS
+#   A wireless-uplink router (STA mode to the campus AP) can lose its DHCP
+#   lease. With no WAN address there is no default route, so the router cannot
+#   reach the portal at all - re-associating the AP does not help either, and
+#   the uplink may only come back hours later. Campus DHCP leases can be short
+#   (~2 h), so there are plenty of chances for a renewal to fail.
+#
+#   The syslog evidence gets destroyed in the process: a transparent-proxy
+#   plugin (UA3F) floods syslog with "network is unreachable" while the uplink
+#   is down, and the ring buffer only holds a few minutes of that. dmesg is not
+#   useful either - wpa_supplicant events go to syslog, not to dmesg.
+#
+#   So this daemon keeps its OWN record and never relies on syslog:
+#     * /tmp/net-watchdog.log      - every sample, RAM only, trimmed to 3000
+#                                    lines (no flash wear, survives an outage,
+#                                    lost only on reboot)
+#     * /etc/net-watchdog.journal  - persistent. Written on every state change
+#                                    and, while the state is bad, at most once
+#                                    every 5 min. Tiny write volume.
+#
+#   Recorded states: OK / NOINET (has IP+route, ping fails) / NOROUTE /
+#   NOIP / NOLINK. That is enough to tell "the portal is down" apart from
+#   "the uplink lost its lease" after the fact.
+#
+# RECOVERY LADDER (only while the uplink is unusable)
+#   NOIP / NOROUTE : >=60s  -> ubus network.interface.<if> renew   (every 2 min)
+#                    >=240s -> down / up the interface            (every 10 min)
+#   NOLINK         : >=120s -> iw dev <sta> disconnect             (every 5 min)
+#   any bad state  : >=900s -> ubus network.wireless reconf       (every 30 min)
+#
+#   All recovery commands run detached (setsid) so that a network
+#   reconfigure can never kill this shell, and the shell can never be killed
+#   by its own recovery action.
+#
+# Usage: net-watchdog {run|once|status|log|journal}
+#   run     - daemon loop (used by procd)
+#   once    - one sample, print it, refresh /tmp/net-watchdog.status
+#   status  - print /tmp/net-watchdog.status
+#   log     - print the RAM sample log
+#   journal - print the persistent journal
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+TAG="net-watchdog"
+
+# --- configuration ---------------------------------------------------------
+# Normal settings are shared with campus-auth so there is only one place to
+# edit. Everything below can be overridden from the environment, which is how
+# the recovery ladder gets drilled without touching the real uplink:
+#
+#   NET_WD_SUFFIX=-test   use separate log/journal/status files
+#   NET_WD_DRY=1          log the actions but do not execute them
+#   NET_WD_INTERVAL=5     sampling interval in seconds
+#   NET_WD_IFACE=wan      watch a different interface
+#   NET_WD_T_RENEW / T_BOUNCE / T_REASSOC / T_RECONF  ladder thresholds
+#
+SUFFIX="${NET_WD_SUFFIX:-}"
+LOG="/tmp/net-watchdog$SUFFIX.log"
+JOURNAL="/etc/net-watchdog$SUFFIX.journal"
+STATUS="/tmp/net-watchdog$SUFFIX.status"
+MAXLOG=3000
+
+INTERVAL="${NET_WD_INTERVAL:-30}"
+DRY="${NET_WD_DRY:-0}"
+T_RENEW="${NET_WD_T_RENEW:-60}"
+T_BOUNCE="${NET_WD_T_BOUNCE:-240}"
+T_REASSOC="${NET_WD_T_REASSOC:-120}"
+T_RECONF="${NET_WD_T_RECONF:-900}"
+
+# minimum spacing between two identical recovery actions
+CD_RENEW="${NET_WD_CD_RENEW:-120}"
+CD_BOUNCE="${NET_WD_CD_BOUNCE:-600}"
+CD_REASSOC="${NET_WD_CD_REASSOC:-300}"
+CD_RECONF="${NET_WD_CD_RECONF:-1800}"
+
+IFACE="${NET_WD_IFACE:-$(uci -q get campusauth.main.iface)}"
+[ -z "$IFACE" ] && IFACE="wwan"
+PING_HOST=$(uci -q get campusauth.main.ping_host); [ -z "$PING_HOST" ] && PING_HOST="223.5.5.5"
+PORTAL=$(uci -q get campusauth.main.server)
+
+log() { logger -p user.notice -t "$TAG" "$*"; }
+
+# Run a command detached from our process group. A network reconfigure must
+# never be able to take this daemon down, and vice versa. In DRY mode the
+# action is only logged.
+bg() {
+    if [ "$DRY" = "1" ]; then
+        log "DRY-RUN would run: $1"
+        return 0
+    fi
+    setsid sh -c "$1" >/dev/null 2>&1 &
+}
+
+# --- sampling -------------------------------------------------------------
+# Sets the STAT_* globals (sample() must not run in a subshell).
+STAT_DEV=""; STAT_IP=""; STAT_GW=""; STAT_AS="-"; STAT_PING="-"; STAT_PRTL="-"; STAT_ST=""; STAT_WIFI=0
+
+sample() {
+    local dev ip gw
+
+    STAT_PING="-"; STAT_PRTL="-"; STAT_WIFI=0
+
+    dev=$(ubus call network.interface."$IFACE" status 2>/dev/null |
+          sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    [ -z "$dev" ] && dev=$(uci -q get "network.${IFACE}.device")
+
+    network_get_ipaddr ip "$IFACE" 2>/dev/null || ip=""
+    case "$ip" in 127.*) ip="" ;; esac
+
+    # The default route must belong to *this* uplink. `ip route show default`
+    # without a device filter happily reports another interface's gateway,
+    # which made a dead port look like it had a route.
+    if [ -n "$dev" ]; then
+        gw=$(ip -4 route show default dev "$dev" 2>/dev/null |
+             sed -n 's/.*via \([0-9.]*\).*/\1/p' | head -1)
+    else
+        gw=$(ip -4 route show default 2>/dev/null |
+             sed -n 's/.*via \([0-9.]*\).*/\1/p' | head -1)
+    fi
+
+    # associated / carrier (as=- when the device is unknown)
+    STAT_AS="-"
+    if [ -n "$dev" ] && [ -d "/sys/class/net/$dev/wireless" ]; then
+        STAT_WIFI=1
+        if iw dev "$dev" link 2>/dev/null | grep -q 'Connected'; then
+            STAT_AS=1
+        else
+            STAT_AS=0
+        fi
+    elif [ -n "$dev" ] && [ -r "/sys/class/net/$dev/carrier" ]; then
+        STAT_AS=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null)
+    fi
+
+    if [ -z "$ip" ]; then
+        if [ "$STAT_AS" = "0" ]; then STAT_ST="NOLINK"; else STAT_ST="NOIP"; fi
+    elif [ -z "$gw" ]; then
+        STAT_ST="NOROUTE"
+    else
+        if ping -c 1 -W 2 "$PING_HOST" >/dev/null 2>&1; then
+            STAT_PING=1; STAT_ST="OK"
+        else
+            STAT_PING=0; STAT_ST="NOINET"
+        fi
+    fi
+
+    STAT_DEV="$dev"; STAT_IP="$ip"; STAT_GW="$gw"
+}
+
+# Portal reachability - only worth probing while something is wrong, and only
+# every few cycles to keep the CPU cost negligible. Skipped entirely when no
+# portal address is configured.
+probe_portal() {
+    [ -z "$PORTAL" ] && { STAT_PRTL="-"; return 0; }
+    if wget -q -O /dev/null -T 4 "http://$PORTAL/" >/dev/null 2>&1; then
+        STAT_PRTL=1
+    else
+        STAT_PRTL=0
+    fi
+}
+
+line() {
+    printf '%s iface=%s dev=%s ip=%s gw=%s as=%s ping=%s prtl=%s st=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$IFACE" \
+        "${STAT_DEV:--}" "${STAT_IP:--}" "${STAT_GW:--}" \
+        "$STAT_AS" "$STAT_PING" "$STAT_PRTL" "$STAT_ST"
+}
+
+write_status() {
+    local since="$1" actions=0
+    [ -f "$JOURNAL" ] && actions=$(grep -c 'ACTION' "$JOURNAL" 2>/dev/null)
+    cat > "$STATUS" <<EOF
+state=$STAT_ST
+iface=$IFACE
+device=${STAT_DEV:--}
+ip=${STAT_IP:--}
+gateway=${STAT_GW:--}
+associated=$STAT_AS
+ping=$STAT_PING
+portal=$STAT_PRTL
+down_for=${since}
+actions=${actions:-0}
+updated=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+}
+
+act() {
+    printf '%s ACTION: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$JOURNAL"
+    log "ACTION: $*"
+}
+
+trim_log() {
+    [ "$(wc -l < "$LOG" 2>/dev/null)" -gt "$MAXLOG" ] || return 0
+    tail -n "$MAXLOG" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+}
+
+trim_journal() {
+    [ "$(wc -c < "$JOURNAL" 2>/dev/null)" -gt 200000 ] || return 0
+    tail -n 500 "$JOURNAL" > "$JOURNAL.tmp" 2>/dev/null && mv "$JOURNAL.tmp" "$JOURNAL"
+}
+
+do_once() {
+    sample
+    line
+    write_status 0
+}
+
+do_run() {
+    local cycle=0 since_ok=0 last_st="" last_j=0
+    local last_renew=0 last_bounce=0 last_reassoc=0 last_reconf=0
+    local now l extra st
+
+    trim_journal
+    log "started (iface=$IFACE interval=${INTERVAL}s portal=$PORTAL dry=$DRY)"
+
+    # give the network a moment to settle after boot
+    sleep "${NET_WD_SETTLE:-20}"
+
+    while true; do
+        cycle=$((cycle + 1))
+        sample
+        now=$(date +%s)
+        st="$STAT_ST"
+
+        # portal probe every 4th bad cycle (cheap, and only useful when broken)
+        if [ "$st" != "OK" ] && [ $((cycle % 4)) -eq 0 ]; then
+            probe_portal
+        fi
+
+        l=$(line)
+        echo "$l" >> "$LOG"
+        [ $((cycle % 20)) -eq 0 ] && trim_log
+
+        if [ "$st" = "OK" ]; then
+            since_ok=0
+        else
+            since_ok=$((since_ok + INTERVAL))
+        fi
+
+        # persistent journal: every transition, plus a 5-minute heartbeat
+        extra=""
+        if [ "$st" != "$last_st" ] && [ -n "$last_st" ]; then
+            extra=" [${last_st}->${st}]"
+        fi
+        if [ -n "$extra" ]; then
+            echo "$l$extra" >> "$JOURNAL"
+            log "state ${last_st:-init} -> $st (ip=${STAT_IP:--} gw=${STAT_GW:--} as=$STAT_AS)"
+            last_j=$now
+        elif [ "$st" != "OK" ] && [ $((now - last_j)) -ge 300 ]; then
+            echo "$l" >> "$JOURNAL"
+            last_j=$now
+        fi
+        last_st="$st"
+
+        # --- recovery ladder -------------------------------------------------
+        case "$st" in
+            NOIP|NOROUTE)
+                if [ "$since_ok" -ge "$T_RENEW" ] && [ $((now - last_renew)) -ge "$CD_RENEW" ]; then
+                    last_renew=$now
+                    bg "ubus call network.interface.$IFACE renew"
+                    act "renew DHCP on $IFACE (no usable address for ${since_ok}s)"
+                fi
+                if [ "$since_ok" -ge "$T_BOUNCE" ] && [ $((now - last_bounce)) -ge "$CD_BOUNCE" ]; then
+                    last_bounce=$now
+                    bg "sleep 1; ubus call network.interface.$IFACE down; sleep 3; ubus call network.interface.$IFACE up"
+                    act "bounce $IFACE (no usable address for ${since_ok}s)"
+                fi
+                ;;
+            NOLINK)
+                if [ "$since_ok" -ge "$T_REASSOC" ] && [ $((now - last_reassoc)) -ge "$CD_REASSOC" ] &&
+                   [ "$STAT_WIFI" = "1" ] && [ -n "$STAT_DEV" ]; then
+                    last_reassoc=$now
+                    bg "iw dev $STAT_DEV disconnect"
+                    act "force reassociation on $STAT_DEV (link down for ${since_ok}s)"
+                fi
+                ;;
+        esac
+
+        if [ "$since_ok" -ge "$T_RECONF" ] && [ $((now - last_reconf)) -ge "$CD_RECONF" ]; then
+            last_reconf=$now
+            bg "sleep 1; ubus call network.wireless reconf"
+            act "wireless reconf (uplink unusable for ${since_ok}s)"
+        fi
+
+        write_status "$since_ok"
+        sleep "$INTERVAL"
+    done
+}
+
+case "$1" in
+    run)     do_run ;;
+    once)    do_once ;;
+    status)  cat "$STATUS" 2>/dev/null || echo "state=unknown" ;;
+    log)     tail -n 200 "$LOG" 2>/dev/null ;;
+    journal) tail -n 200 "$JOURNAL" 2>/dev/null ;;
+    *)       echo "Usage: $0 {run|once|status|log|journal}"; exit 1 ;;
+esac
+exit 0

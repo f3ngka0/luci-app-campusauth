@@ -1,0 +1,20 @@
+# Everything here is installed on Linux and executed by busybox ash / Lua on
+# the router. A single CR breaks `#!/bin/sh` (the classic "not found" error),
+# so normalise to LF in the repository AND in the working tree, on every
+# platform, including Windows checkouts.
+* text=auto eol=lf
+
+# Explicit, so nobody has to guess:
+*.sh          text eol=lf
+*.lua         text eol=lf
+*.json        text eol=lf
+*.md          text eol=lf
+Makefile      text eol=lf
+LICENSE       text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# Files copied verbatim into the router image.
+root/etc/init.d/*   text eol=lf
+root/etc/config/*   text eol=lf
+root/usr/bin/*      text eol=lf

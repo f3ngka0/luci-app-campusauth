@@ -1,0 +1,45 @@
+# Configuration for luci-app-campusauth
+#
+# UCI values are read by /usr/bin/campus-auth and by the LuCI page
+# (Services -> Campus Portal Login).
+
+config campusauth 'main'
+	# Start the auto-login daemon at boot.
+	option enabled '1'
+
+	# --- credentials -------------------------------------------------------
+	# Dr.COM's portal protocol sends the password as a plain HTTP GET
+	# parameter, so it cannot be hashed here. Leave these empty in a shared
+	# copy of this file and fill them in on the device (or via the LuCI page).
+	option username ''
+	option password ''
+
+	# Service type, sent to the portal in the R3 field:
+	#   0 = 校园网 / campus, 1 = 中国移动, 2 = 中国电信,
+	#   3 = 中国联通, 4 = 中国广电
+	option isp '0'
+
+	# --- portal ------------------------------------------------------------
+	# Address of your school's Dr.COM portal. There is deliberately no default:
+	# it is site specific. Capture a login (see README) or read the URL of the
+	# login page to find it.
+	option server ''
+
+	# Logical interface that holds the campus IP (usually 'wwan' when the
+	# uplink is a Wi-Fi STA / relay).
+	option iface 'wwan'
+
+	# --- detection ---------------------------------------------------------
+	# Seconds between checks. On repeated failures the interval backs off
+	# (doubling up to 32x), except when the uplink has no address at all, in
+	# which case it keeps polling quickly so recovery is not delayed.
+	option interval '30'
+
+	# Cheap reachability probe used before asking the portal. Note that many
+	# campus gateways drop ICMP, in which case the portal is asked instead and
+	# a failing ping alone does not trigger a login.
+	option ping_host '223.5.5.5'
+
+	# --- runtime state (written by the daemon, do not edit) ----------------
+	option last_login ''
+	option last_result ''

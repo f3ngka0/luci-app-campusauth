@@ -1,0 +1,14 @@
+{
+  "luci-app-campusauth": {
+    "description": "Campus network (Dr.COM portal) auto-login",
+    "read": {
+      "file": {
+        "/tmp/campus-auth.status": [ "read" ]
+      },
+      "uci": [ "campusauth" ]
+    },
+    "write": {
+      "uci": [ "campusauth" ]
+    }
+  }
+}

@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Secrets and per-device state. Never commit a filled-in config.
+# ---------------------------------------------------------------------------
+**/campusauth.local
+*.secret
+*.token
+.env
+.env.*
+secrets/
+
+# Packet captures can contain a plaintext portal password.
+*.pcap
+*.pcapng
+*.cap
+*.pcap.gz
+
+# Runtime state produced by the daemons on a live router.
+*.journal
+*.status
+
+# ---------------------------------------------------------------------------
+# Build artefacts (OpenWrt buildroot)
+# ---------------------------------------------------------------------------
+*.ipk
+*.apk
+*.o
+*.ko
+*.tar.gz
+/bin/
+/build_dir/
+/staging_dir/
+/tmp/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ---------------------------------------------------------------------------
+# Language tooling
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+
+# ---------------------------------------------------------------------------
+# Scratch
+# ---------------------------------------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej

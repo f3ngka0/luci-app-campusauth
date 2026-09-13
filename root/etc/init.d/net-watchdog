@@ -1,0 +1,27 @@
+#!/bin/sh /etc/rc.common
+# net-watchdog - keeps a durable record of uplink health and recovers the
+# campus uplink when the DHCP lease is lost. See /usr/bin/net-watchdog.
+
+START=93
+STOP=11
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/net-watchdog run
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}
+
+stop_service() {
+    # the daemon exits on SIGTERM; any detached recovery helper finishes on
+    # its own (it is in its own session, so it is not killed with us)
+    :
+}
+
+reload_service() {
+    stop
+    start
+}
