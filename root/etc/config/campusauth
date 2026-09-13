@@ -35,9 +35,14 @@ config campusauth 'main'
 	# which case it keeps polling quickly so recovery is not delayed.
 	option interval '30'
 
-	# Cheap reachability probe used before asking the portal. Note that many
-	# campus gateways drop ICMP, in which case the portal is asked instead and
-	# a failing ping alone does not trigger a login.
+	# Liveness probe: an HTTP GET, deliberately NOT a ping. Campus gateways
+	# commonly rate-limit or outright drop ICMP, which makes a ping-based check
+	# report "offline" while the network is perfectly usable. Point this at
+	# something small and reliable in your region.
+	option probe_url 'http://www.baidu.com/'
+
+	# Secondary signal only, consulted when the portal is unreachable as well.
+	# A failing ping never on its own triggers a login.
 	option ping_host '223.5.5.5'
 
 	# --- runtime state (written by the daemon, do not edit) ----------------

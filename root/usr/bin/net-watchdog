@@ -21,15 +21,37 @@
 #                                    and, while the state is bad, at most once
 #                                    every 5 min. Tiny write volume.
 #
-#   Recorded states: OK / NOINET (has IP+route, ping fails) / NOROUTE /
-#   NOIP / NOLINK. That is enough to tell "the portal is down" apart from
-#   "the uplink lost its lease" after the fact.
+# LIVENESS PROBE: HTTP, NOT ICMP  <-- changed after a real incident
+#   Campus gateways commonly rate-limit or outright drop ICMP. Measured on one
+#   campus uplink while everything worked perfectly:
+#       TCP  (HTTP GET to the outside) : 6/6 OK
+#       ICMP 114.114.114.114           : 100% packet loss
+#       ICMP 223.5.5.5                 : 10% packet loss
+#   A ping-based probe therefore reports "down" while the network is fine, and
+#   acting on that false alarm made things much worse: a forced interface
+#   bounce cost 11 minutes of downtime plus a radio restart that disconnected
+#   the very client diagnosing the problem.
+#   => The liveness probe is an HTTP GET. ICMP is not used at all.
 #
-# RECOVERY LADDER (only while the uplink is unusable)
-#   NOIP / NOROUTE : >=60s  -> ubus network.interface.<if> renew   (every 2 min)
-#                    >=240s -> down / up the interface            (every 10 min)
-#   NOLINK         : >=120s -> iw dev <sta> disconnect             (every 5 min)
-#   any bad state  : >=900s -> ubus network.wireless reconf       (every 30 min)
+# STATES
+#   OK      : interface up + associated + IPv4 + default route + HTTP probe ok
+#   IFDOWN  : netifd does not consider the interface up (or has no device)
+#   NOLINK  : the uplink device is not associated / has no carrier
+#   NOIP    : associated but no usable IPv4 address or no default route
+#   NOHTTP  : everything present but the HTTP probe fails
+#
+# RECOVERY LADDER - strictly ONE action per sample, cheapest first
+#   IFDOWN : >=60s  -> ubus network.interface.<if> up      (every 3 min)
+#   NOLINK : >=120s -> iw dev <sta> disconnect             (every 5 min, wifi)
+#   NOIP   : >=90s  -> ubus network.interface.<if> renew   (every 3 min)
+#   NOHTTP : >=600s -> ubus network.interface.<if> renew   (every 10 min)
+#
+#   NOT done automatically any more: `down`+`up` of the interface and
+#   `wireless reconf`. Both restart the radio that carries the AP the clients
+#   are associated to, so they disconnect the user who is trying to diagnose
+#   the problem, and a bounce can leave the interface with no lease for many
+#   minutes. They are opt-in via NET_WD_ALLOW_REBOUNCE=1 / config
+#   netwatchdog.main.allow_rebounce.
 #
 #   All recovery commands run detached (setsid) so that a network
 #   reconfigure can never kill this shell, and the shell can never be killed
@@ -56,7 +78,8 @@ TAG="net-watchdog"
 #   NET_WD_DRY=1          log the actions but do not execute them
 #   NET_WD_INTERVAL=5     sampling interval in seconds
 #   NET_WD_IFACE=wan      watch a different interface
-#   NET_WD_T_RENEW / T_BOUNCE / T_REASSOC / T_RECONF  ladder thresholds
+#   NET_WD_T_UP / T_RENEW / T_REASSOC / T_NOHTTP / T_BOUNCE
+#   NET_WD_CD_UP / CD_RENEW / CD_REASSOC / CD_RECONF
 #
 SUFFIX="${NET_WD_SUFFIX:-}"
 LOG="/tmp/net-watchdog$SUFFIX.log"
@@ -66,21 +89,32 @@ MAXLOG=3000
 
 INTERVAL="${NET_WD_INTERVAL:-30}"
 DRY="${NET_WD_DRY:-0}"
-T_RENEW="${NET_WD_T_RENEW:-60}"
-T_BOUNCE="${NET_WD_T_BOUNCE:-240}"
-T_REASSOC="${NET_WD_T_REASSOC:-120}"
-T_RECONF="${NET_WD_T_RECONF:-900}"
 
-# minimum spacing between two identical recovery actions
-CD_RENEW="${NET_WD_CD_RENEW:-120}"
-CD_BOUNCE="${NET_WD_CD_BOUNCE:-600}"
+T_UP="${NET_WD_T_UP:-60}"
+T_RENEW="${NET_WD_T_RENEW:-90}"
+T_REASSOC="${NET_WD_T_REASSOC:-120}"
+T_NOHTTP="${NET_WD_T_NOHTTP:-600}"
+T_BOUNCE="${NET_WD_T_BOUNCE:-1800}"
+
+CD_UP="${NET_WD_CD_UP:-180}"
+CD_RENEW="${NET_WD_CD_RENEW:-180}"
 CD_REASSOC="${NET_WD_CD_REASSOC:-300}"
-CD_RECONF="${NET_WD_CD_RECONF:-1800}"
+CD_BOUNCE="${NET_WD_CD_BOUNCE:-1800}"
 
 IFACE="${NET_WD_IFACE:-$(uci -q get campusauth.main.iface)}"
 [ -z "$IFACE" ] && IFACE="wwan"
-PING_HOST=$(uci -q get campusauth.main.ping_host); [ -z "$PING_HOST" ] && PING_HOST="223.5.5.5"
+
+# External HTTP endpoint used as the liveness probe. ICMP is deliberately not
+# used (see the header). Pick something small and reliable in your region.
+PROBE_URL="${NET_WD_PROBE_URL:-$(uci -q get campusauth.main.probe_url)}"
+[ -z "$PROBE_URL" ] && PROBE_URL="http://www.baidu.com/"
+
+# Portal address: informational only (tells "campus only" apart from "nothing").
 PORTAL=$(uci -q get campusauth.main.server)
+
+# Interface bounce / wireless reconf are disruptive; opt in explicitly.
+ALLOW_REBOUNCE="${NET_WD_ALLOW_REBOUNCE:-$(uci -q get netwatchdog.main.allow_rebounce)}"
+[ "$ALLOW_REBOUNCE" = "1" ] || ALLOW_REBOUNCE=0
 
 log() { logger -p user.notice -t "$TAG" "$*"; }
 
@@ -97,32 +131,42 @@ bg() {
 
 # --- sampling -------------------------------------------------------------
 # Sets the STAT_* globals (sample() must not run in a subshell).
-STAT_DEV=""; STAT_IP=""; STAT_GW=""; STAT_AS="-"; STAT_PING="-"; STAT_PRTL="-"; STAT_ST=""; STAT_WIFI=0
+STAT_DEV=""; STAT_IP=""; STAT_GW=""; STAT_AS="-"; STAT_HTTP="-"; STAT_PRTL="-"
+STAT_ST=""; STAT_WIFI=0; STAT_UP=0
 
 sample() {
-    local dev ip gw
+    local j dev ip gw
 
-    STAT_PING="-"; STAT_PRTL="-"; STAT_WIFI=0
+    STAT_HTTP="-"; STAT_PRTL="-"; STAT_WIFI=0; STAT_UP=0
 
-    dev=$(ubus call network.interface."$IFACE" status 2>/dev/null |
-          sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    # --- interface state straight from netifd ------------------------------
+    j=$(ubus call network.interface."$IFACE" status 2>/dev/null | tr -d ' \t\n')
+    case "$j" in *'"up":true'*) STAT_UP=1 ;; esac
+
+    dev=$(printf '%s' "$j" | sed -n 's/.*"l3_device":"\([^"]*\)".*/\1/p')
     [ -z "$dev" ] && dev=$(uci -q get "network.${IFACE}.device")
 
-    network_get_ipaddr ip "$IFACE" 2>/dev/null || ip=""
+    ip=$(printf '%s' "$j" | sed -n 's/.*"ipv4-address":\[{"address":"\([0-9.]*\)".*/\1/p')
+
+    # Cross-check against the kernel: netifd can still report an address for an
+    # interface that has just gone down, which produced confusing samples
+    # ("ip=10.99.x.x dev=-").
+    if [ -n "$ip" ] && [ -n "$dev" ]; then
+        ip -4 addr show dev "$dev" 2>/dev/null | grep -q "inet $ip/" || ip=""
+    fi
+    [ -n "$ip" ] || ip=""
     case "$ip" in 127.*) ip="" ;; esac
 
     # The default route must belong to *this* uplink. `ip route show default`
-    # without a device filter happily reports another interface's gateway,
-    # which made a dead port look like it had a route.
+    # without a device filter happily reports another interface's gateway.
     if [ -n "$dev" ]; then
         gw=$(ip -4 route show default dev "$dev" 2>/dev/null |
              sed -n 's/.*via \([0-9.]*\).*/\1/p' | head -1)
     else
-        gw=$(ip -4 route show default 2>/dev/null |
-             sed -n 's/.*via \([0-9.]*\).*/\1/p' | head -1)
+        gw=""
     fi
 
-    # associated / carrier (as=- when the device is unknown)
+    # --- association / carrier --------------------------------------------
     STAT_AS="-"
     if [ -n "$dev" ] && [ -d "/sys/class/net/$dev/wireless" ]; then
         STAT_WIFI=1
@@ -135,24 +179,32 @@ sample() {
         STAT_AS=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null)
     fi
 
-    if [ -z "$ip" ]; then
-        if [ "$STAT_AS" = "0" ]; then STAT_ST="NOLINK"; else STAT_ST="NOIP"; fi
-    elif [ -z "$gw" ]; then
-        STAT_ST="NOROUTE"
-    else
-        if ping -c 1 -W 2 "$PING_HOST" >/dev/null 2>&1; then
-            STAT_PING=1; STAT_ST="OK"
-        else
-            STAT_PING=0; STAT_ST="NOINET"
-        fi
-    fi
-
     STAT_DEV="$dev"; STAT_IP="$ip"; STAT_GW="$gw"
+
+    # --- state -------------------------------------------------------------
+    if [ -z "$dev" ] || [ "$STAT_UP" != "1" ]; then
+        STAT_ST="IFDOWN"
+    elif [ "$STAT_AS" = "0" ]; then
+        STAT_ST="NOLINK"
+    elif [ -z "$ip" ] || [ -z "$gw" ]; then
+        STAT_ST="NOIP"
+    elif probe_http; then
+        STAT_HTTP=1
+        STAT_ST="OK"
+    else
+        STAT_HTTP=0
+        STAT_ST="NOHTTP"
+    fi
 }
 
-# Portal reachability - only worth probing while something is wrong, and only
-# every few cycles to keep the CPU cost negligible. Skipped entirely when no
-# portal address is configured.
+# Liveness = can we actually fetch something over TCP?
+probe_http() {
+    wget -q -O /dev/null -T 5 "$PROBE_URL" >/dev/null 2>&1
+}
+
+# Portal reachability - informational, and only while something is wrong, so
+# that "the campus is fine but the outside is not" can be told apart from
+# "nothing works". Skipped when no portal address is configured.
 probe_portal() {
     [ -z "$PORTAL" ] && { STAT_PRTL="-"; return 0; }
     if wget -q -O /dev/null -T 4 "http://$PORTAL/" >/dev/null 2>&1; then
@@ -163,10 +215,10 @@ probe_portal() {
 }
 
 line() {
-    printf '%s iface=%s dev=%s ip=%s gw=%s as=%s ping=%s prtl=%s st=%s\n' \
+    printf '%s iface=%s dev=%s up=%s ip=%s gw=%s as=%s http=%s prtl=%s st=%s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" "$IFACE" \
-        "${STAT_DEV:--}" "${STAT_IP:--}" "${STAT_GW:--}" \
-        "$STAT_AS" "$STAT_PING" "$STAT_PRTL" "$STAT_ST"
+        "${STAT_DEV:--}" "$STAT_UP" "${STAT_IP:--}" "${STAT_GW:--}" \
+        "$STAT_AS" "$STAT_HTTP" "$STAT_PRTL" "$STAT_ST"
 }
 
 write_status() {
@@ -176,13 +228,16 @@ write_status() {
 state=$STAT_ST
 iface=$IFACE
 device=${STAT_DEV:--}
+iface_up=$STAT_UP
 ip=${STAT_IP:--}
 gateway=${STAT_GW:--}
 associated=$STAT_AS
-ping=$STAT_PING
-portal=$STAT_PRTL
+probe=${STAT_HTTP}
+portal=${STAT_PRTL}
+probe_url=$PROBE_URL
 down_for=${since}
 actions=${actions:-0}
+rebounce=${ALLOW_REBOUNCE}
 updated=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
 }
@@ -204,17 +259,18 @@ trim_journal() {
 
 do_once() {
     sample
+    [ "$STAT_ST" != "OK" ] && probe_portal
     line
     write_status 0
 }
 
 do_run() {
     local cycle=0 since_ok=0 last_st="" last_j=0
-    local last_renew=0 last_bounce=0 last_reassoc=0 last_reconf=0
+    local last_up=0 last_renew=0 last_reassoc=0 last_bounce=0
     local now l extra st
 
     trim_journal
-    log "started (iface=$IFACE interval=${INTERVAL}s portal=$PORTAL dry=$DRY)"
+    log "started (iface=$IFACE interval=${INTERVAL}s probe=$PROBE_URL dry=$DRY rebounce=$ALLOW_REBOUNCE)"
 
     # give the network a moment to settle after boot
     sleep "${NET_WD_SETTLE:-20}"
@@ -225,7 +281,7 @@ do_run() {
         now=$(date +%s)
         st="$STAT_ST"
 
-        # portal probe every 4th bad cycle (cheap, and only useful when broken)
+        # extra probes only when something is wrong, and not every cycle
         if [ "$st" != "OK" ] && [ $((cycle % 4)) -eq 0 ]; then
             probe_portal
         fi
@@ -247,7 +303,7 @@ do_run() {
         fi
         if [ -n "$extra" ]; then
             echo "$l$extra" >> "$JOURNAL"
-            log "state ${last_st:-init} -> $st (ip=${STAT_IP:--} gw=${STAT_GW:--} as=$STAT_AS)"
+            log "state ${last_st:-init} -> $st (up=$STAT_UP ip=${STAT_IP:--} gw=${STAT_GW:--} as=$STAT_AS)"
             last_j=$now
         elif [ "$st" != "OK" ] && [ $((now - last_j)) -ge 300 ]; then
             echo "$l" >> "$JOURNAL"
@@ -255,18 +311,13 @@ do_run() {
         fi
         last_st="$st"
 
-        # --- recovery ladder -------------------------------------------------
+        # --- recovery ladder: exactly ONE action per sample, cheapest first ---
         case "$st" in
-            NOIP|NOROUTE)
-                if [ "$since_ok" -ge "$T_RENEW" ] && [ $((now - last_renew)) -ge "$CD_RENEW" ]; then
-                    last_renew=$now
-                    bg "ubus call network.interface.$IFACE renew"
-                    act "renew DHCP on $IFACE (no usable address for ${since_ok}s)"
-                fi
-                if [ "$since_ok" -ge "$T_BOUNCE" ] && [ $((now - last_bounce)) -ge "$CD_BOUNCE" ]; then
-                    last_bounce=$now
-                    bg "sleep 1; ubus call network.interface.$IFACE down; sleep 3; ubus call network.interface.$IFACE up"
-                    act "bounce $IFACE (no usable address for ${since_ok}s)"
+            IFDOWN)
+                if [ "$since_ok" -ge "$T_UP" ] && [ $((now - last_up)) -ge "$CD_UP" ]; then
+                    last_up=$now
+                    bg "ubus call network.interface.$IFACE up"
+                    act "bring up $IFACE (netifd reports it down for ${since_ok}s)"
                 fi
                 ;;
             NOLINK)
@@ -277,12 +328,32 @@ do_run() {
                     act "force reassociation on $STAT_DEV (link down for ${since_ok}s)"
                 fi
                 ;;
+            NOIP)
+                if [ "$since_ok" -ge "$T_RENEW" ] && [ $((now - last_renew)) -ge "$CD_RENEW" ]; then
+                    last_renew=$now
+                    bg "ubus call network.interface.$IFACE renew"
+                    act "renew DHCP on $IFACE (no usable address for ${since_ok}s)"
+                fi
+                ;;
+            NOHTTP)
+                # IP and route look fine but nothing can be fetched. Usually the
+                # campus session or something upstream, not the uplink. Only
+                # nudge the lease after a long while.
+                if [ "$since_ok" -ge "$T_NOHTTP" ] && [ $((now - last_renew)) -ge "$CD_RENEW" ]; then
+                    last_renew=$now
+                    bg "ubus call network.interface.$IFACE renew"
+                    act "renew DHCP on $IFACE (HTTP probe failing for ${since_ok}s)"
+                fi
+                ;;
         esac
 
-        if [ "$since_ok" -ge "$T_RECONF" ] && [ $((now - last_reconf)) -ge "$CD_RECONF" ]; then
-            last_reconf=$now
-            bg "sleep 1; ubus call network.wireless reconf"
-            act "wireless reconf (uplink unusable for ${since_ok}s)"
+        # Disruptive last resort, disabled unless explicitly enabled: it takes
+        # down the radio the local AP lives on.
+        if [ "$ALLOW_REBOUNCE" = "1" ] && [ "$since_ok" -ge "$T_BOUNCE" ] &&
+           [ $((now - last_bounce)) -ge "$CD_BOUNCE" ]; then
+            last_bounce=$now
+            bg "sleep 1; ubus call network.interface.$IFACE down; sleep 3; ubus call network.interface.$IFACE up"
+            act "bounce $IFACE (uplink unusable for ${since_ok}s)"
         fi
 
         write_status "$since_ok"

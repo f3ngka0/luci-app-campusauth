@@ -1,0 +1,19 @@
+# Configuration for the uplink watchdog (/usr/bin/net-watchdog).
+#
+# Everything else (interface, portal address, probe URL) is read from
+# /etc/config/campusauth so that the connection details live in one place.
+
+config netwatchdog 'main'
+
+	# Allow the disruptive last-resort recovery: `down` + `up` of the uplink
+	# interface when it has been unusable for 30 minutes.
+	#
+	# Off by default on purpose. Bringing the interface down restarts the radio
+	# that also carries the local AP, so every Wi-Fi client - including the one
+	# you are debugging from - is disconnected, and the interface can be left
+	# with no DHCP lease for several minutes. On one campus network a single
+	# forced bounce cost 11 minutes of downtime.
+	#
+	# The safe recoveries (interface `up`, DHCP `renew`, forced reassociation)
+	# are always enabled; they do not disturb other clients.
+	option allow_rebounce '0'

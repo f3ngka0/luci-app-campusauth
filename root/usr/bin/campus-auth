@@ -251,19 +251,21 @@ do_logout() {
     return 1
 }
 
-# Offline detection: cheap ping first, portal status as confirmation.
-# Ping alone is not enough (ICMP may be blocked while the net is fine),
-# and the portal alone is not enough either (server may be unreachable).
+# Offline detection.
+#
+# The cheap liveness probe is an HTTP GET, NOT a ping. Campus gateways commonly
+# rate-limit or outright drop ICMP; measured on one campus uplink while TCP was
+# 6/6 fine, ICMP to 114.114.114.114 was 100% lost and to 223.5.5.5 10% lost.
+# A ping-first check therefore declares "offline" while the network is
+# perfectly usable, which produced a stream of bogus "probe failed" states and
+# (via the watchdog) some very disruptive recovery attempts.
+#
+# Order:   no WAN IP -> give up (uplink problem, watchdog owns it)
+#          HTTP probe ok -> online
+#          portal says online -> online
+#          otherwise -> log in
 do_check() {
-    local host st
-    host=$(cfg ping_host)
-    [ -z "$host" ] && host="223.5.5.5"
-
-    if ping -c 1 -W 3 "$host" >/dev/null 2>&1; then
-        log "check: online (ping ${host} ok)"
-        write_state "online" "网络正常"
-        return 0
-    fi
+    local host st url
 
     # No WAN address at all means this is not a portal problem - there is no
     # route to the portal to begin with. net-watchdog owns DHCP recovery; just
@@ -275,14 +277,42 @@ do_check() {
         return 3
     fi
 
-    st=$(do_status)
-    if [ "$st" = "1" ] || [ "$st" = "ok" ]; then
-        log "check: ping failed but portal reports online (result=${st}) - skip login"
-        write_state "online" "探测失败但认证在线"
+    url=$(cfg probe_url)
+    [ -z "$url" ] && url="http://www.baidu.com/"
+    if wget -q -O /dev/null -T 5 "$url" >/dev/null 2>&1; then
+        log "check: online (HTTP probe ok)"
+        write_state "online" "网络正常"
         return 0
     fi
 
-    log "check: offline (ping ${host} failed, portal result=${st:-empty}) -> login"
+    # The outside is unreachable. Ask the portal: it is authoritative for the
+    # session we care about, and it sits on the campus network so it can still
+    # answer when the way out is broken.
+    st=$(do_status)
+    case "$st" in
+        1|ok)
+            log "check: HTTP probe failed but portal reports online (${st}) - skip login"
+            write_state "online" "外网探测失败但认证在线"
+            return 0
+            ;;
+        0)
+            log "check: portal reports offline -> login"
+            do_login
+            return $?
+            ;;
+    esac
+
+    # Portal unreachable as well. ICMP is only a tiebreaker here, so a broken
+    # ICMP path cannot on its own cause a pointless login.
+    host=$(cfg ping_host)
+    [ -z "$host" ] && host="223.5.5.5"
+    if ping -c 1 -W 3 "$host" >/dev/null 2>&1; then
+        log "check: portal unreachable but ping ${host} ok - nothing to do"
+        write_state "online" "认证服务器无响应，但网络可用"
+        return 0
+    fi
+
+    log "check: offline (probe failed, portal result=${st:-empty}) -> login"
     do_login
 }
 

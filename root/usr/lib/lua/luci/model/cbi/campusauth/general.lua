@@ -67,8 +67,14 @@ o = s:option(Value, "interval", translate("检测间隔（秒）"),
 o.default = "30"
 o.datatype = "and(uinteger,min(10))"
 
-o = s:option(Value, "ping_host", translate("连通性探测地址"),
-             translate("先用 ping 快速判断，失败后再问认证服务器确认"))
+o = s:option(Value, "probe_url", translate("连通性探测地址（HTTP）"),
+             translate("用一次 HTTP GET 判断外网是否可用。不要改用 ping —— " ..
+                       "校园网关常丢弃 ICMP，会把正常网络误判成离线。"))
+o.default = "http://www.baidu.com/"
+o.rmempty = false
+
+o = s:option(Value, "ping_host", translate("备用探测地址（ping）"),
+             translate("仅在认证服务器也无响应时作参考，不会单独决定是否登录。"))
 o.default = "223.5.5.5"
 
 s = m:section(SimpleSection, translate("运行状态"))
@@ -116,16 +122,18 @@ end
 
 local WD_STATE = {
     OK      = '<span style="color:#2f8f3f;font-weight:bold">正常</span>',
-    NOINET  = '<span style="color:#a60;font-weight:bold">有 IP 但上不了网</span>',
-    NOROUTE = '<span style="color:#c33;font-weight:bold">无默认路由</span>',
+    NOHTTP  = '<span style="color:#a60;font-weight:bold">有 IP 但探测失败</span>',
     NOIP    = '<span style="color:#c33;font-weight:bold">无 IP（租约丢失）</span>',
-    NOLINK  = '<span style="color:#c33;font-weight:bold">无线未关联</span>',
+    NOLINK  = '<span style="color:#c33;font-weight:bold">上行未关联</span>',
+    IFDOWN  = '<span style="color:#c33;font-weight:bold">接口未启用</span>',
 }
 
 s = m:section(SimpleSection, translate("上行链路看门狗"),
-              translate("独立于系统日志记录上行状态，并在 DHCP 租约丢失时自动恢复" ..
-                        "（重新续租 → 重启接口 → 强制重连 → 重载无线）。" ..
-                        "断网时 UA3F 会把系统日志刷爆，所以这里是唯一可靠的现场记录。"))
+              translate("独立于系统日志记录上行状态，并在上行不可用时自动恢复" ..
+                        "（接口 up → 重新续租 → 强制重连）。" ..
+                        "断网时 UA3F 会把系统日志刷爆，所以这里是唯一可靠的现场记录。") ..
+              " " .. translate("活性探测走 HTTP 而不是 ping：校园网关常丢弃 ICMP，" ..
+                               "用 ping 判断会把正常网络误判成离线。"))
 
 o = s:option(DummyValue, "_wd_state", translate("链路状态"))
 o.rawhtml = true
@@ -137,11 +145,15 @@ o.cfgvalue = function()
     local st      = txt:match("state=([^\n]*)") or "unknown"
     local iface   = txt:match("iface=([^\n]*)") or "-"
     local dev     = txt:match("device=([^\n]*)") or "-"
+    local ifup    = txt:match("iface_up=([^\n]*)") or "-"
     local ip      = txt:match("ip=([^\n]*)") or "-"
     local gw      = txt:match("gateway=([^\n]*)") or "-"
     local asoc    = txt:match("associated=([^\n]*)") or "-"
+    local probe   = txt:match("probe=([^\n]*)") or "-"
+    local purl    = txt:match("probe_url=([^\n]*)") or "-"
     local downfor = tonumber(txt:match("down_for=([^\n]*)")) or 0
     local acts    = txt:match("actions=([^\n]*)") or "0"
+    local rebnc   = txt:match("rebounce=([^\n]*)") or "0"
     local upd     = txt:match("updated=([^\n]*)") or ""
 
     local cell = "padding:2px 10px 2px 0;color:#666"
@@ -149,17 +161,24 @@ o.cfgvalue = function()
     html = html .. "<tr><td style='" .. cell .. "'>状态</td><td>"
             .. (WD_STATE[st] or ("<b>" .. luci.util.pcdata(st) .. "</b>")) .. "</td></tr>"
     html = html .. "<tr><td style='" .. cell .. "'>接口</td><td>"
-            .. luci.util.pcdata(iface) .. " / " .. luci.util.pcdata(dev) .. "</td></tr>"
+            .. luci.util.pcdata(iface) .. " / " .. luci.util.pcdata(dev)
+            .. (ifup == "1" and "" or "（netifd 未启用）") .. "</td></tr>"
     html = html .. "<tr><td style='" .. cell .. "'>WAN IP</td><td>"
             .. luci.util.pcdata(ip) .. "（网关 " .. luci.util.pcdata(gw) .. "）</td></tr>"
-    html = html .. "<tr><td style='" .. cell .. "'>无线关联</td><td>"
-            .. (asoc == "1" and "已连接" or "未连接") .. "</td></tr>"
+    html = html .. "<tr><td style='" .. cell .. "'>上行关联</td><td>"
+            .. (asoc == "1" and "已连接" or (asoc == "0" and "未连接" or "不适用")) .. "</td></tr>"
+    html = html .. "<tr><td style='" .. cell .. "'>HTTP 探测</td><td>"
+            .. (probe == "1" and "<span style='color:#2f8f3f'>通</span>"
+                or (probe == "0" and "<span style='color:#c33'>不通</span>" or "未测"))
+            .. "  <span style='color:#999;font-size:12px'>" .. luci.util.pcdata(purl)
+            .. "</span></td></tr>"
     if downfor > 0 then
         html = html .. "<tr><td style='" .. cell .. "'>异常持续</td><td style='color:#c33'>"
                 .. downfor .. " 秒</td></tr>"
     end
     html = html .. "<tr><td style='" .. cell .. "'>累计恢复动作</td><td>"
-            .. luci.util.pcdata(acts) .. " 次</td></tr>"
+            .. luci.util.pcdata(acts) .. " 次"
+            .. (rebnc == "1" and "（已允许重启接口）" or "") .. "</td></tr>"
     html = html .. "<tr><td style='" .. cell .. "'>采样时间</td><td>"
             .. luci.util.pcdata(upd) .. "</td></tr>"
     return html .. "</table>"
