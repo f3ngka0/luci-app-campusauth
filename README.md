@@ -2,18 +2,6 @@
 
 **校园网 Dr.COM Portal 自动登录插件（OpenWrt / ImmortalWrt LuCI 应用）**
 
-断线自动重登，附带一个「上行链路看门狗」—— 因为**上行丢了 DHCP 租约时根本没有路由到认证服务器**，光靠重登是救不回来的。
-
-> **English:** A LuCI app that keeps a Dr.COM campus portal session alive. It
-> polls the portal, detects a dropped session and logs back in automatically.
-> It ships with a companion uplink watchdog, because the most common failure is
-> not the portal session but a **lost DHCP lease on the WAN** — which leaves the
-> router with no route to the portal at all. The watchdog records WAN health to
-> a durable journal (syslog is useless during an outage) and recovers the
-> uplink by itself.
-
----
-
 ## 功能
 
 - **自动重登**：检测掉线，自动重新登录 Dr.COM Portal，支持 5 种登录方式
@@ -25,7 +13,7 @@
 - **LuCI 页面**：`服务 → 校园网认证`，可填账号/密码/登录方式，有手动登录、
   注销、刷新按钮，以及运行状态与事件记录。
 - **持久化事件记录**：`/etc/campus-auth.journal`，重启不丢。
-- **配套上行看门狗**：记录上行健康状态并自动恢复（见下文）。
+- **上行看门狗**：记录上行健康状态并自动恢复。
 
 ## 环境要求
 
@@ -33,7 +21,7 @@
   本插件不依赖防火墙能力）。
 - `luci-compat`（Lua CBI 模型需要）。
 - `wget`（busybox 自带或 `uclient-fetch` 提供）。
-- 已能正常访问校园网认证服务器（抓包确认过协议）。
+- 已能正常访问校园网认证服务器。
 
 依赖 `ip`、`ubus`、`iw`、`ping`、`logger` —— 都是 OpenWrt 基础组件。
 
@@ -60,10 +48,6 @@ luci-app-campusauth/
         │   └── model/cbi/campusauth/general.lua
         └── share/rpcd/acl.d/
             └── luci-app-campusauth.json
-```
-
-> 仓库里的 `root/etc/config/campusauth` **凭据字段是空的**，`server` 也是空的
-> （各校地址不同，故意不给默认值）。装完必须自己填。
 
 ## 安装
 
@@ -237,53 +221,6 @@ syslog，不进内核环缓冲。所以要自己留一份。
 > ⚠️ 接口 `down/up` 会重启该接口所在射频；如果本机 AP 和上行 STA 在同一射频上，
 > 你的 Wi-Fi 会中断约 10 秒。这是最后手段，只在断网超过 4 分钟时触发。
 
-### 演练模式（安全验证恢复逻辑）
-
-不要拿真实链路去试恢复动作。看门狗支持环境变量覆盖与 DRY-RUN，
-可以用一个无害接口把整个阶梯跑一遍：
-
-```sh
-NET_WD_SUFFIX=-test NET_WD_DRY=1 NET_WD_IFACE=wan NET_WD_INTERVAL=5 \
-NET_WD_SETTLE=2 NET_WD_T_RENEW=10 NET_WD_T_BOUNCE=20 NET_WD_T_RECONF=9999 \
-NET_WD_CD_RENEW=15 NET_WD_CD_BOUNCE=25 \
-setsid /usr/bin/net-watchdog run >/dev/null 2>&1 &
-
-# 等 60 秒，看它是否按顺序触发了 renew / bounce
-cat /etc/net-watchdog-test.journal
-
-# 清场（procd 会自动把真实例拉回来）
-killall net-watchdog
-rm -f /tmp/net-watchdog-test.log /etc/net-watchdog-test.journal
-```
-
-可覆盖的变量：`SUFFIX` `DRY` `INTERVAL` `SETTLE` `IFACE`
-`T_RENEW` `T_BOUNCE` `T_REASSOC` `T_RECONF` `CD_RENEW` `CD_BOUNCE`
-`CD_REASSOC` `CD_RECONF`。
-
-## 换个学校怎么适配
-
-参数名（`DDDDD` / `upass` / `R3` / `wlan_user_ip`）在不同学校的 Dr.COM
-部署里可能不同，所以第一步是抓一次你自己的登录：
-
-```sh
-# 在路由器上装抓包工具
-opkg update && opkg install tcpdump
-
-# 抓「与认证服务器的全部流量」。把 <portal-ip> 换成你学校的认证服务器地址。
-# 先注销、确认断网，再在浏览器里重新登录一次，完整流程都要抓到。
-tcpdump -i <wan-if> -nn -A -s0 -c 200 'host <portal-ip> and tcp port 80' > /tmp/portal.txt 2>&1
-
-# 找 GET 请求
-grep -o 'GET /[^ ]*' /tmp/portal.txt | head
-```
-
-> 抓到的包里**含明文密码**，分析完请立刻删除：`rm -f /tmp/portal.txt`。
-
-拿到的 `GET /drcom/login?...` 那一行就是全部参数。对照
-`/usr/bin/campus-auth` 里的 `do_login()` 改：
-- 参数名不同 → 改 URL 拼接那几行；
-- 运营商字段不同 → 改 `R3` 的取值和 LuCI 里的下拉项；
-- 接口路径不同（有的学校是 `/drcom/login`，有的是 `/?user_account=...`）→ 改路径。
 
 ## 故障排查
 
@@ -298,20 +235,6 @@ grep -o 'GET /[^ ]*' /tmp/portal.txt | head
 | LuCI 页面 404 | `rm -rf /tmp/luci-indexcache /tmp/luci-modulecache` 后刷新 |
 | 脚本报 `not found` / 语法错误 | 文件带 CRLF。`tr -d '\r' < f > f.tmp && mv f.tmp f` |
 
-## 隐私与安全
-
-- **本仓库不含任何真实凭据**：账号、密码、学号、姓名、邮箱、手机号、
-  MAC、SSID、公网/内网 IP、Cookie、Token、本地绝对路径**均已移除**，
-  相关位置改用占位符或留空。
-- **`server` 故意没有默认值**。上游代码里曾经硬编码一个私网地址作为兜底，
-  那会让别人家的路由器去访问一个不存在的内网主机；现在为空则由脚本明确报错。
-- 唯一保留的 IP 字面量是 `223.5.5.5`（阿里公共 DNS），仅作为
-  “先做一次廉价连通性探测”的默认目标，可在 `ping_host` 里改成任意你信任的地址。
-- **密码是明文存储的**：Dr.COM 的登录请求本身就把密码放在 URL 查询串里，
-  插件无法加密它。请把路由器的管理密码设置得足够强，
-  不要把带凭据的 `/etc/config/campusauth` 分享出去，也不要提交进版本库。
-- 抓包文件（`*.pcap`）已在 `.gitignore` 中排除 —— 它们含明文密码。
-- 建议在路由器上限制 LuCI 的访问来源，或改用 HTTPS + 强口令。
 
 ## 许可
 
