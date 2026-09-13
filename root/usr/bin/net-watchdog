@@ -40,13 +40,22 @@
 #   NOIP    : associated but no usable IPv4 address or no default route
 #   NOHTTP  : everything present but the HTTP probe fails
 #
-# RECOVERY LADDER - strictly ONE action per sample, cheapest first
-#   IFDOWN : >=60s  -> ubus network.interface.<if> up      (every 3 min)
-#   NOLINK : >=120s -> iw dev <sta> disconnect             (every 5 min, wifi)
-#   NOIP   : >=90s  -> ubus network.interface.<if> renew   (every 3 min)
-#   NOHTTP : >=600s -> ubus network.interface.<if> renew   (every 10 min)
+# RECOVERY LADDER - strictly ONE action per sample
+#   IFDOWN : >=60s  -> ubus network.interface.<if> up   (every 3 min)
+#   NOLINK : >=120s -> iw dev <sta> disconnect          (every 5 min, wifi)
+#   NOIP / NOHTTP   -> recorded only, deliberately no action
 #
-#   NOT done automatically any more: `down`+`up` of the interface and
+# WHY `renew` IS NOT IN THE LADDER
+#   `ubus call network.interface.<if> renew` sends SIGUSR1 to udhcpc, which
+#   forces the whole RENEWING -> REBINDING -> lease-lost sequence on a very
+#   short fuse. Measured: 13 seconds of silence from the server and the lease
+#   was torn down, even though 5000 s of it were left. A campus DHCP server
+#   that is merely slow for a minute therefore turns into a full outage - and
+#   both real outages on this router were caused by a forced renew, not by the
+#   campus. Left alone, udhcpc keeps DISCOVERing (-t 0 = forever) and a
+#   *scheduled* renewal has ~an hour of slack, so a slow server costs nothing.
+#
+#   Also NOT done automatically: `down`+`up` of the interface and
 #   `wireless reconf`. Both restart the radio that carries the AP the clients
 #   are associated to, so they disconnect the user who is trying to diagnose
 #   the problem, and a bounce can leave the interface with no lease for many
@@ -78,8 +87,9 @@ TAG="net-watchdog"
 #   NET_WD_DRY=1          log the actions but do not execute them
 #   NET_WD_INTERVAL=5     sampling interval in seconds
 #   NET_WD_IFACE=wan      watch a different interface
-#   NET_WD_T_UP / T_RENEW / T_REASSOC / T_NOHTTP / T_BOUNCE
-#   NET_WD_CD_UP / CD_RENEW / CD_REASSOC / CD_RECONF
+#   NET_WD_T_UP / T_REASSOC / T_BOUNCE
+#   NET_WD_CD_UP / CD_REASSOC / CD_BOUNCE
+#   NET_WD_ALLOW_REBOUNCE=1  enable the disruptive down/up last resort
 #
 SUFFIX="${NET_WD_SUFFIX:-}"
 LOG="/tmp/net-watchdog$SUFFIX.log"
@@ -91,13 +101,10 @@ INTERVAL="${NET_WD_INTERVAL:-30}"
 DRY="${NET_WD_DRY:-0}"
 
 T_UP="${NET_WD_T_UP:-60}"
-T_RENEW="${NET_WD_T_RENEW:-90}"
 T_REASSOC="${NET_WD_T_REASSOC:-120}"
-T_NOHTTP="${NET_WD_T_NOHTTP:-600}"
 T_BOUNCE="${NET_WD_T_BOUNCE:-1800}"
 
 CD_UP="${NET_WD_CD_UP:-180}"
-CD_RENEW="${NET_WD_CD_RENEW:-180}"
 CD_REASSOC="${NET_WD_CD_REASSOC:-300}"
 CD_BOUNCE="${NET_WD_CD_BOUNCE:-1800}"
 
@@ -266,7 +273,7 @@ do_once() {
 
 do_run() {
     local cycle=0 since_ok=0 last_st="" last_j=0
-    local last_up=0 last_renew=0 last_reassoc=0 last_bounce=0
+    local last_up=0 last_reassoc=0 last_bounce=0
     local now l extra st
 
     trim_journal
@@ -311,7 +318,18 @@ do_run() {
         fi
         last_st="$st"
 
-        # --- recovery ladder: exactly ONE action per sample, cheapest first ---
+        # --- recovery ladder: exactly ONE action per sample ----------------
+        #
+        # `ubus call network.interface.<if> renew` is deliberately NOT used.
+        # It sends SIGUSR1 to udhcpc, which forces the whole
+        # RENEWING -> REBINDING -> lease-lost sequence on a very short fuse
+        # (observed: 21s -> 34s, i.e. 13 seconds of silence from the server and
+        # the lease is torn down, even with 5000s of lease time left). A campus
+        # DHCP server that is merely slow for a minute then turns into a full
+        # outage. Left alone, udhcpc follows its own schedule and a scheduled
+        # renewal has ~an hour of slack before the lease actually expires.
+        # Both real outages on this router were triggered by a forced renew,
+        # so the ladder only contains actions that cannot cost the lease.
         case "$st" in
             IFDOWN)
                 if [ "$since_ok" -ge "$T_UP" ] && [ $((now - last_up)) -ge "$CD_UP" ]; then
@@ -329,21 +347,15 @@ do_run() {
                 fi
                 ;;
             NOIP)
-                if [ "$since_ok" -ge "$T_RENEW" ] && [ $((now - last_renew)) -ge "$CD_RENEW" ]; then
-                    last_renew=$now
-                    bg "ubus call network.interface.$IFACE renew"
-                    act "renew DHCP on $IFACE (no usable address for ${since_ok}s)"
-                fi
+                # Interface is up but has no address: udhcpc was started with
+                # `-t 0` and keeps sending DISCOVERs forever, so it recovers by
+                # itself once the server answers. Do not touch the lease.
+                :
                 ;;
             NOHTTP)
-                # IP and route look fine but nothing can be fetched. Usually the
-                # campus session or something upstream, not the uplink. Only
-                # nudge the lease after a long while.
-                if [ "$since_ok" -ge "$T_NOHTTP" ] && [ $((now - last_renew)) -ge "$CD_RENEW" ]; then
-                    last_renew=$now
-                    bg "ubus call network.interface.$IFACE renew"
-                    act "renew DHCP on $IFACE (HTTP probe failing for ${since_ok}s)"
-                fi
+                # Address and route are fine but nothing can be fetched; that is
+                # the campus session or something upstream, not the uplink.
+                :
                 ;;
         esac
 

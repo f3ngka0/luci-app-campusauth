@@ -234,28 +234,36 @@ syslog，不进内核环缓冲。所以要自己留一份。
 
 ### 恢复阶梯
 
-**每次采样只执行一个动作**，从最便宜的往上选：
+**每次采样只执行一个动作**：
 
 | 状态 | 阈值 | 动作 |
 |---|---|---|
 | `IFDOWN` | ≥60 s | `ubus call network.interface.<if> up`（每 3 min 一次） |
 | `NOLINK`（仅无线） | ≥120 s | `iw dev <sta> disconnect` 强制重连（每 5 min 一次） |
-| `NOIP` | ≥90 s | `ubus call network.interface.<if> renew`（每 3 min 一次） |
-| `NOHTTP` | ≥600 s | `ubus call network.interface.<if> renew`（每 10 min 一次） |
+| `NOIP` / `NOHTTP` | — | **只记录，不动手** |
 
 所有恢复命令都用 `setsid` 甩到独立会话执行，避免"重配网络把自己的 shell 弄死"。
 
-### 刻意**不**自动做的事
+### 刻意**不**自动做的事（都是踩出来的）
 
-接口 `down` + `up` 和 `wireless reconf` **默认关闭**，需要在
-`/etc/config/netwatchdog` 里把 `allow_rebounce` 设为 `1` 才启用。
+**1. 绝不调用 `renew`。**
+`ubus call network.interface.<if> renew` 会给 udhcpc 发 SIGUSR1，强制走
+RENEWING → REBINDING → 租约丢失 的短引信路径。实测：服务器沉默 **13 秒**，
+就把还剩 **5000 多秒**的租约拆掉了。这等于「只要校园 DHCP 慢一分钟，就放大成
+一次彻底断网」—— 本机两次真实断网都是被强制 renew 触发的，与学校无关。
 
-原因很实际：本机 AP 和上行 STA 常常在**同一个射频**上，把接口按下去会重启整个
-射频，于是**连正在排查问题的那台设备也被踢下线**；而且接口重新 up 之后可能好
-几分钟都拿不到 DHCP 租约。在一个校园网上，一次这样的"恢复"直接造成了
-**11 分钟**的完全断网 —— 比它想修的问题还严重。
+放着不管时反而更安全：udhcpc 以 `-t 0` 无限重试 DISCOVER，而**定时**续租在
+租约到期前有近一小时的余量，服务器慢一点完全不影响。
 
-上面四个安全动作（`up` / `renew` / `disconnect`）不受影响，始终启用。
+**2. 不自动 `down`+`up`，也不 `wireless reconf`。**
+默认关闭，要在 `/etc/config/netwatchdog` 里把 `allow_rebounce` 设为 `1` 才启用。
+本机 AP 和上行 STA 通常在同一射频上，把接口按下去会重启整个射频，
+**连正在排查问题的那台设备也被踢下线**；而且重新 up 之后可能好几分钟拿不到
+DHCP 租约（实测一次 **11 分钟**）。
+
+因此 `NOIP`（接口在、没地址）交给 udhcpc 自己重试即可，
+`NOHTTP`（地址和路由都正常但外网不通）属于学校侧或认证会话问题，
+看门狗不会去动租约。
 
 
 ## 故障排查
